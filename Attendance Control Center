@@ -1,4 +1,4 @@
-const ACC_WEBAPP_URL = 'PASTE_YOUR_WEBAPP_URL_HERE';
+const ACC_WEBAPP_URL = 'https://script.google.com/macros/s/AKfycbzHzpOqtwB_IZYhld0wNSrhWPNNHnTD6PweJ35mRJU5kRp8ICWM_-Un1LLDIQ1-bbMl/exec';
 
 const ACC = Object.freeze({
   SHEETS: Object.freeze({

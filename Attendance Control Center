@@ -1,4 +1,5 @@
 const ACC_WEBAPP_URL = 'https://script.google.com/macros/s/AKfycbzHzpOqtwB_IZYhld0wNSrhWPNNHnTD6PweJ35mRJU5kRp8ICWM_-Un1LLDIQ1-bbMl/exec';
+const ACC_OWNER_EMAIL = 'pmo@butlerleather.com';
 
 const ACC = Object.freeze({
   SHEETS: Object.freeze({
@@ -49,6 +50,22 @@ function generateAttendanceFile() {
   const ui = SpreadsheetApp.getUi();
 
   try {
+    const currentUser = String(Session.getActiveUser().getEmail() || '').trim();
+
+    if (currentUser.toLowerCase() === ACC_OWNER_EMAIL.toLowerCase()) {
+      const result = generateAttendanceFileServer_({
+        spreadsheetId: SpreadsheetApp.getActiveSpreadsheet().getId(),
+        requestedBy: currentUser,
+      });
+
+      ui.alert(
+        'Generate Attendance File',
+        result.message || 'No response received.',
+        ui.ButtonSet.OK
+      );
+      return;
+    }
+
     if (!ACC_WEBAPP_URL || ACC_WEBAPP_URL === 'PASTE_YOUR_WEBAPP_URL_HERE') {
       ui.alert(
         'Generate Attendance File',
@@ -63,7 +80,7 @@ function generateAttendanceFile() {
       contentType: 'application/json',
       payload: JSON.stringify({
         spreadsheetId: SpreadsheetApp.getActiveSpreadsheet().getId(),
-        requestedBy: Session.getActiveUser().getEmail() || '',
+        requestedBy: currentUser,
       }),
       muteHttpExceptions: true,
     });

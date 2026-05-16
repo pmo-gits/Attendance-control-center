@@ -36,7 +36,14 @@ const ACC = Object.freeze({
 
   PROTECTION: Object.freeze({
     DESCRIPTION_PREFIX: 'ACC_MANAGED_PROTECTION',
+    LOCK_START_COL: 1,
+    LOCK_END_COL: 7,
   }),
+
+  MONTHS: Object.freeze([
+    'January', 'February', 'March', 'April', 'May', 'June',
+    'July', 'August', 'September', 'October', 'November', 'December',
+  ]),
 });
 
 function onOpen() {
@@ -125,13 +132,6 @@ function generateAttendanceFileServer_(payload) {
   const ss = SpreadsheetApp.openById(payload.spreadsheetId);
   const lock = LockService.getScriptLock();
 
-  const protectionContext = {
-    sheet: null,
-    headerMap: null,
-    rowsToProtect: [],
-    protectionsRemoved: false,
-  };
-
   try {
     lock.waitLock(30000);
   } catch (e) {
@@ -149,9 +149,6 @@ function generateAttendanceFileServer_(payload) {
     if (!sh) throw new Error(`Sheet not found: ${ACC.SHEETS.ATTENDANCE_CONTROL}`);
 
     const headerMap = accGetHeaderMap_(sh, ACC.INPUTS.HEADER_ROW);
-
-    protectionContext.sheet = sh;
-    protectionContext.headerMap = headerMap;
 
     accValidateRequiredHeaders_(headerMap, [
       ACC.HEADERS.PAYROLL_MONTH_KEY,
@@ -216,6 +213,22 @@ function generateAttendanceFileServer_(payload) {
       return {
         success: false,
         message: `Year in row ${targetRow} must be a 4-digit value.`,
+      };
+    }
+
+    const sequenceCheck = accValidateSequentialEntryDiscipline_(sh, headerMap, targetRow);
+    if (sequenceCheck.block) {
+      return {
+        success: false,
+        message: sequenceCheck.message,
+      };
+    }
+
+    const continuityCheck = accValidateMonthContinuity_(sh, headerMap, targetRow, month, year);
+    if (continuityCheck.block) {
+      return {
+        success: false,
+        message: continuityCheck.message,
       };
     }
 
@@ -294,14 +307,8 @@ function generateAttendanceFileServer_(payload) {
 
     SpreadsheetApp.flush();
 
-    const rowsToProtect = accGetProtectedRowsByFileName_(sh, headerMap);
-    protectionContext.rowsToProtect = rowsToProtect;
-
-    accRemoveScriptManagedProtections_(sh);
-    protectionContext.protectionsRemoved = true;
-
-    accRestoreManagedProtections_(sh, headerMap, rowsToProtect);
-    protectionContext.protectionsRemoved = false;
+    // Only protect the new row — existing row protections are left untouched
+    accRestoreManagedProtections_(sh, [targetRow]);
 
     return {
       success: true,
@@ -309,20 +316,6 @@ function generateAttendanceFileServer_(payload) {
     };
 
   } catch (err) {
-    try {
-      if (
-        protectionContext.protectionsRemoved &&
-        protectionContext.sheet &&
-        protectionContext.headerMap
-      ) {
-        accRestoreManagedProtections_(
-          protectionContext.sheet,
-          protectionContext.headerMap,
-          protectionContext.rowsToProtect || []
-        );
-      }
-    } catch (restoreErr) {}
-
     return {
       success: false,
       message: `Error: ${err && err.message ? err.message : err}`,
@@ -333,6 +326,110 @@ function generateAttendanceFileServer_(payload) {
       lock.releaseLock();
     } catch (e) {}
   }
+}
+
+function accValidateSequentialEntryDiscipline_(sheet, headerMap, targetRow) {
+  const lastRow = sheet.getLastRow();
+  if (lastRow <= targetRow) {
+    return { block: false, message: '' };
+  }
+
+  const startRow = targetRow + 1;
+  const numRows  = lastRow - targetRow;
+  const lastCol  = sheet.getLastColumn();
+
+  // ONE bulk read for all rows below the target row
+  const data = sheet.getRange(startRow, 1, numRows, lastCol).getDisplayValues();
+
+  const colsToCheck = [
+    headerMap[ACC.HEADERS.PAYROLL_MONTH_KEY],
+    headerMap[ACC.HEADERS.MONTH],
+    headerMap[ACC.HEADERS.YEAR],
+    headerMap[ACC.HEADERS.MONTHLY_ATTENDANCE_FILE_NAME],
+    headerMap[ACC.HEADERS.MONTHLY_ATTENDANCE_FILE_ID],
+    headerMap[ACC.HEADERS.CREATED_ON],
+    headerMap[ACC.HEADERS.CREATED_BY],
+    headerMap[ACC.HEADERS.REMARKS],
+  ].map(c => c - 1); // convert to 0-based
+
+  for (let r = 0; r < data.length; r++) {
+    for (const col of colsToCheck) {
+      if (String(data[r][col] || '').trim()) {
+        return {
+          block: true,
+          message:
+            `Row ${targetRow} must be completed before using lower rows.\n` +
+            `Data is already present in row ${startRow + r}.\n\n` +
+            `Please clear all lower-row entries and proceed strictly in order.`,
+        };
+      }
+    }
+  }
+
+  return { block: false, message: '' };
+}
+
+function accValidateMonthContinuity_(sheet, headerMap, targetRow, pendingMonth, pendingYear) {
+  const lastRow = sheet.getLastRow();
+  if (lastRow < ACC.INPUTS.FIRST_DATA_ROW) {
+    return { block: false, message: '' };
+  }
+
+  if (targetRow <= ACC.INPUTS.FIRST_DATA_ROW) {
+    return { block: false, message: '' };
+  }
+
+  const numRows = targetRow - ACC.INPUTS.FIRST_DATA_ROW;
+  const lastCol = sheet.getLastColumn();
+
+  // ONE bulk read for all rows before the target row
+  const data = sheet.getRange(ACC.INPUTS.FIRST_DATA_ROW, 1, numRows, lastCol).getDisplayValues();
+
+  const fileNameCol = headerMap[ACC.HEADERS.MONTHLY_ATTENDANCE_FILE_NAME] - 1;
+  const monthCol    = headerMap[ACC.HEADERS.MONTH] - 1;
+  const yearCol     = headerMap[ACC.HEADERS.YEAR] - 1;
+
+  let lastCompletedMonth = null;
+  let lastCompletedYear  = null;
+
+  for (let i = 0; i < data.length; i++) {
+    const fileName = String(data[i][fileNameCol] || '').trim();
+    if (fileName) {
+      lastCompletedMonth = String(data[i][monthCol] || '').trim();
+      lastCompletedYear  = String(data[i][yearCol]  || '').trim();
+    }
+  }
+
+  if (!lastCompletedMonth || !lastCompletedYear) {
+    return { block: false, message: '' };
+  }
+
+  const lastMonthIndex = ACC.MONTHS.indexOf(lastCompletedMonth);
+  if (lastMonthIndex === -1) {
+    return {
+      block: true,
+      message: `Unable to determine month continuity. Last completed row has an unrecognised month: "${lastCompletedMonth}".`,
+    };
+  }
+
+  const expectedMonthIndex = (lastMonthIndex + 1) % 12;
+  const expectedMonth = ACC.MONTHS[expectedMonthIndex];
+  const expectedYear = lastMonthIndex === 11
+    ? String(Number(lastCompletedYear) + 1)
+    : lastCompletedYear;
+
+  if (pendingMonth !== expectedMonth || pendingYear !== expectedYear) {
+    return {
+      block: true,
+      message:
+        `Month continuity check failed.\n\n` +
+        `Expected: ${expectedMonth}_${expectedYear}\n` +
+        `Found: ${pendingMonth}_${pendingYear}\n\n` +
+        `Attendance months must be entered in strict sequential order.`,
+    };
+  }
+
+  return { block: false, message: '' };
 }
 
 function accGetConfigMap_(spreadsheet) {
@@ -420,16 +517,16 @@ function accFindNextAttendanceInputRow_(sheet, headerMap) {
     lastCol
   ).getDisplayValues();
 
-  const monthCol = headerMap[ACC.HEADERS.MONTH] - 1;
-  const yearCol = headerMap[ACC.HEADERS.YEAR] - 1;
+  const monthCol    = headerMap[ACC.HEADERS.MONTH] - 1;
+  const yearCol     = headerMap[ACC.HEADERS.YEAR] - 1;
   const fileNameCol = headerMap[ACC.HEADERS.MONTHLY_ATTENDANCE_FILE_NAME] - 1;
-  const fileIdCol = headerMap[ACC.HEADERS.MONTHLY_ATTENDANCE_FILE_ID] - 1;
+  const fileIdCol   = headerMap[ACC.HEADERS.MONTHLY_ATTENDANCE_FILE_ID] - 1;
 
   for (let i = 0; i < data.length; i++) {
-    const month = String(data[i][monthCol] || '').trim();
-    const year = String(data[i][yearCol] || '').trim();
+    const month    = String(data[i][monthCol]    || '').trim();
+    const year     = String(data[i][yearCol]     || '').trim();
     const fileName = String(data[i][fileNameCol] || '').trim();
-    const fileId = String(data[i][fileIdCol] || '').trim();
+    const fileId   = String(data[i][fileIdCol]   || '').trim();
 
     if (month && year && !fileName && !fileId) {
       return ACC.INPUTS.FIRST_DATA_ROW + i;
@@ -456,13 +553,13 @@ function accCheckDuplicateInAttendanceControl_(sheet, headerMap, payrollMonthKey
   ).getDisplayValues();
 
   const monthKeyCol = headerMap[ACC.HEADERS.PAYROLL_MONTH_KEY] - 1;
-  const monthCol = headerMap[ACC.HEADERS.MONTH] - 1;
-  const yearCol = headerMap[ACC.HEADERS.YEAR] - 1;
+  const monthCol    = headerMap[ACC.HEADERS.MONTH] - 1;
+  const yearCol     = headerMap[ACC.HEADERS.YEAR] - 1;
   const fileNameCol = headerMap[ACC.HEADERS.MONTHLY_ATTENDANCE_FILE_NAME] - 1;
-  const fileIdCol = headerMap[ACC.HEADERS.MONTHLY_ATTENDANCE_FILE_ID] - 1;
+  const fileIdCol   = headerMap[ACC.HEADERS.MONTHLY_ATTENDANCE_FILE_ID] - 1;
 
   const targetMonth = String(month || '').trim().toUpperCase();
-  const targetYear = String(year || '').trim();
+  const targetYear  = String(year  || '').trim();
 
   for (let i = 0; i < data.length; i++) {
     const rowNum = ACC.INPUTS.FIRST_DATA_ROW + i;
@@ -470,10 +567,10 @@ function accCheckDuplicateInAttendanceControl_(sheet, headerMap, payrollMonthKey
     if (rowNum === skipRow) continue;
 
     const rowMonthKey = String(data[i][monthKeyCol] || '').trim();
-    const rowMonth = String(data[i][monthCol] || '').trim().toUpperCase();
-    const rowYear = String(data[i][yearCol] || '').trim();
+    const rowMonth    = String(data[i][monthCol]    || '').trim().toUpperCase();
+    const rowYear     = String(data[i][yearCol]     || '').trim();
     const rowFileName = String(data[i][fileNameCol] || '').trim();
-    const rowFileId = String(data[i][fileIdCol] || '').trim();
+    const rowFileId   = String(data[i][fileIdCol]   || '').trim();
 
     if (rowFileName === fileName) {
       return {
@@ -534,47 +631,7 @@ function accUpdateOptionalMetaDataKeys_(spreadsheet, updates) {
   });
 }
 
-function accGetProtectedRowsByFileName_(sheet, headerMap) {
-  const col = headerMap[ACC.HEADERS.MONTHLY_ATTENDANCE_FILE_NAME];
-  const lastRow = sheet.getLastRow();
-
-  if (lastRow < ACC.INPUTS.FIRST_DATA_ROW) {
-    return [];
-  }
-
-  const values = sheet.getRange(
-    ACC.INPUTS.FIRST_DATA_ROW,
-    col,
-    lastRow - ACC.INPUTS.HEADER_ROW,
-    1
-  ).getDisplayValues();
-
-  const rows = [];
-
-  for (let i = 0; i < values.length; i++) {
-    const v = String(values[i][0] || '').trim();
-
-    if (v) {
-      rows.push(ACC.INPUTS.FIRST_DATA_ROW + i);
-    }
-  }
-
-  return rows;
-}
-
-function accRemoveScriptManagedProtections_(sheet) {
-  const protections = sheet.getProtections(SpreadsheetApp.ProtectionType.RANGE);
-
-  protections.forEach(protection => {
-    const desc = String(protection.getDescription() || '');
-
-    if (desc.indexOf(ACC.PROTECTION.DESCRIPTION_PREFIX) === 0) {
-      protection.remove();
-    }
-  });
-}
-
-function accRestoreManagedProtections_(sheet, headerMap, rowNumbers) {
+function accRestoreManagedProtections_(sheet, rowNumbers) {
   const uniqueRows = Array.from(
     new Set((rowNumbers || []).filter(r => Number(r) >= ACC.INPUTS.FIRST_DATA_ROW))
   ).sort((a, b) => a - b);
@@ -582,50 +639,27 @@ function accRestoreManagedProtections_(sheet, headerMap, rowNumbers) {
   if (!uniqueRows.length) return;
 
   uniqueRows.forEach(rowNum => {
-    accProtectRangeBlock_(
-      sheet,
+    const range = sheet.getRange(
       rowNum,
-      headerMap[ACC.HEADERS.PAYROLL_MONTH_KEY],
-      headerMap[ACC.HEADERS.YEAR],
-      `ROW_${rowNum}_A`
+      ACC.PROTECTION.LOCK_START_COL,
+      1,
+      ACC.PROTECTION.LOCK_END_COL - ACC.PROTECTION.LOCK_START_COL + 1
     );
 
-    accProtectRangeBlock_(
-      sheet,
-      rowNum,
-      headerMap[ACC.HEADERS.MONTHLY_ATTENDANCE_FILE_NAME],
-      headerMap[ACC.HEADERS.MONTHLY_ATTENDANCE_FILE_ID],
-      `ROW_${rowNum}_B`
-    );
+    const protection = range.protect();
+    protection.setDescription(`${ACC.PROTECTION.DESCRIPTION_PREFIX}_ROW_${rowNum}`);
 
-    accProtectRangeBlock_(
-      sheet,
-      rowNum,
-      headerMap[ACC.HEADERS.CREATED_ON],
-      headerMap[ACC.HEADERS.CREATED_BY],
-      `ROW_${rowNum}_C`
-    );
+    const me = Session.getEffectiveUser();
+    const editors = protection.getEditors();
+
+    if (editors.length) {
+      protection.removeEditors(editors);
+    }
+
+    protection.addEditor(me);
+
+    if (protection.canDomainEdit()) {
+      protection.setDomainEdit(false);
+    }
   });
-}
-
-function accProtectRangeBlock_(sheet, rowNum, startCol, endCol, suffix) {
-  if (!startCol || !endCol) return;
-
-  const range = sheet.getRange(rowNum, startCol, 1, endCol - startCol + 1);
-  const protection = range.protect();
-
-  protection.setDescription(`${ACC.PROTECTION.DESCRIPTION_PREFIX}_${suffix}`);
-
-  const me = Session.getEffectiveUser();
-  const editors = protection.getEditors();
-
-  if (editors.length) {
-    protection.removeEditors(editors);
-  }
-
-  protection.addEditor(me);
-
-  if (protection.canDomainEdit()) {
-    protection.setDomainEdit(false);
-  }
 }
